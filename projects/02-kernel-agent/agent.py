@@ -51,6 +51,94 @@ REASONING_KEYS = ("reasoning", "reasoning_content")
 
 WEIGHTS = dict(parses=0.1, rules=0.2, runs=0.2, correct=0.5)
 
+# Names the model invents, mapped to the primitive that actually exists. Measured: listing
+# "closest names" via difflib sent it from nl.value to nl.scalar to nl.sbuf_scalar. Name the
+# replacement instead.
+INVENTED_API = {
+    "dot": "There is no nl.dot. Matrix multiply is nisa.nc_matmul(dst=, stationary=, moving=) into a PSUM tile.",
+    "matmul": "Do not call a matmul helper. Use nisa.nc_matmul(dst=, stationary=, moving=).",
+    "mm": "There is no nl.mm. Use nisa.nc_matmul(dst=, stationary=, moving=).",
+    "mean": "There is no nl.mean or tile.mean. Reduce with nl.sum(view, axis=[...]) and scale with nisa.tensor_scalar.",
+    "average": "There is no average helper. Reduce with nl.sum, then scale with nisa.tensor_scalar.",
+    "avg": "There is no avg helper. Reduce with nl.sum, then scale with nisa.tensor_scalar.",
+    "value": "There is no nl.value. Allocate a tile with nl.ndarray(shape, dtype=..., buffer=nl.sbuf).",
+    "sbuf_scalar": "There is no nl.sbuf_scalar. Allocate with nl.ndarray(shape, dtype=..., buffer=nl.sbuf).",
+    "scalar": "There is no nl.scalar. Scale a tile with nisa.tensor_scalar(dst=, data=, op0=nl.multiply, operand0=...).",
+    "zeros": "Do not use numpy zeros. Allocate with nl.ndarray(...) and write into it.",
+    "ones": "Do not use numpy ones. Allocate with nl.ndarray(...) and write into it.",
+    "transpose": "Do not call a transpose helper or .T. Move elements with nisa.dma_copy into the transposed layout.",
+    "dma_transpose": "Do not switch to dma_transpose to escape a failure. Keep nested loops and nisa.dma_copy.",
+}
+
+# One-line, level-specific instruction for "it ran, numbers are wrong". No worked kernel --
+# a second example in the prompt was measured to make every level worse.
+MISMATCH_HINT = {
+    1: ("Pooling: take a strided window with tile.ap([[stride, count], ...]), nl.sum over the "
+        "window axes, then divide by pool_size**2 with nisa.tensor_scalar. Do not call mean."),
+    2: ("Transpose: move each element with nisa.dma_copy into the swapped layout. Keep nested "
+        "loops; do not call .T, np.transpose, or dma_transpose."),
+    3: ("Single-tile matmul: dma_copy both operands HBM->sbuf (left operand is already "
+        "transposed, K on the partition axis), nisa.nc_matmul into a psum tile, "
+        "nisa.tensor_copy to sbuf, nisa.dma_copy to the shared_hbm output."),
+    4: ("This shape is larger than one tile. Loop M, N and K in chunks that fit the limits "
+        "(partition <= 128). Accumulate K into ONE psum tile allocated outside the K loop. "
+        "Do not allocate one tile for the whole tensor."),
+    5: "Correctness is not enough: hoist loads that the inner loop re-reads every pass.",
+    6: "Block M and N to buy reuse in SBUF; stay under SBUF capacity.",
+    7: "Block M, N and K. Traffic must sit near the byte floor.",
+    8: ("Keep the scores matrix on-chip. A seq x seq write to HBM and a read-back is the "
+        "mistake that dominates."),
+}
+
+
+def invented_fix(attr):
+    return INVENTED_API.get(attr, "")
+
+
+def instruct_on_rules(level, message):
+    extra = []
+    if "exceeds the maximum" in message or "Tile it" in message:
+        extra.append(f"Loop that axis in chunks of at most {nkibench.PMAX} with "
+                     f"nl.affine_range; allocate the tile inside the loop at the chunk size.")
+    if "hands the whole operation to a framework" in message:
+        extra.append("Delete the framework call and compute the same thing with nl/nisa only.")
+    hint = MISMATCH_HINT.get(level)
+    if hint and extra:
+        extra.append(hint)
+    if not extra:
+        return message
+    return message + " " + " ".join(extra)
+
+
+def instruct_on_mismatch(level, message):
+    hint = MISMATCH_HINT.get(level)
+    if not hint:
+        return message
+    if hint[:40] in message:
+        return message
+    return message + " " + hint
+
+
+def fingerprint(feedback, limit=110):
+    """One line the model can refuse to repeat. Full traces blow the repair budget."""
+    one = " ".join((feedback or "").split())
+    return one[:limit]
+
+
+def compact_ledger(tried, limit=5):
+    lines = []
+    for item in dict.fromkeys(tried):
+        lines.append(f"- {fingerprint(item)}")
+        if len(lines) >= limit:
+            break
+    return "\n".join(lines)
+
+
+def clip_source(source, limit=3500):
+    if len(source) <= limit:
+        return source
+    return source[:limit] + "\n# ... truncated; keep the same function name and finish the kernel"
+
 
 def grade(source, level):
     """Returns (reward, parts, feedback). Feedback is an INSTRUCTION, never just a verdict."""
@@ -80,8 +168,9 @@ def grade(source, level):
                      f"def {nkibench.LEVELS[level]['entry']}({args}):  "
                      f"and put @nki.jit on the line above it.")
         return (sum(WEIGHTS[k] for k, v in parts.items() if v), parts,
-                "Rule violations, which score zero however fast the kernel is. Fix exactly "
-                "these: " + " ".join(violations) + extra)
+                instruct_on_rules(level,
+                    "Rule violations, which score zero however fast the kernel is. Fix exactly "
+                    "these: " + " ".join(violations) + extra))
     parts["rules"] = True
 
     spec = nkibench.LEVELS[level]
@@ -129,9 +218,13 @@ def grade(source, level):
                              enrich(f"raised {type(e).__name__}: {e}")))
             continue
         parts["runs"] = True
-        m = (nkibench.check_inputs_untouched(before, args)
-             or nkibench.describe_mismatch(got, want)
-             or nkibench.check_traffic_bar(level, counted, args, want))
+        m = nkibench.check_inputs_untouched(before, args)
+        if not m:
+            m = nkibench.describe_mismatch(got, want)
+            if m:
+                m = instruct_on_mismatch(level, m)
+        if not m:
+            m = nkibench.check_traffic_bar(level, counted, args, want)
         # A simulator warning about a hardware-correctness hazard counts as a failure even when the
         # numbers happen to match on CPU: the kernel would be wrong on the device.
         hazards = [w for w in counted.get("warnings", [])
@@ -141,7 +234,7 @@ def grade(source, level):
                  + ". Fix that before anything else -- the simulator agrees with the reference here "
                    "and the device would not.")
         if m:
-            failures.append((nkibench.label(case, level), m))
+            failures.append((nkibench.label(case, level), instruct_on_mismatch(level, m)))
             continue
         passed += 1
         if level >= 3 and counted["bytes"]:
@@ -339,9 +432,14 @@ def enrich(error_text):
                 "them into tiles, e.g. src=a[0:128, 0:64].")
     m = re.search(r"module '([\w.]+)' has no attribute '(\w+)'", error_text)
     if m:
-        return error_text + available_names(f"{m.group(1)}.{m.group(2)}")
+        named = invented_fix(m.group(2))
+        extra = f" {named}" if named else available_names(f"{m.group(1)}.{m.group(2)}")
+        return error_text + extra
     m = re.search(r"'(\w+)' object has no attribute '(\w+)'", error_text)
     if m:
+        named = invented_fix(m.group(2))
+        if named:
+            return error_text + " " + named
         return (error_text + f" A {m.group(1)} is not a numpy array, so it has no "
                 f"`{m.group(2)}`. Use the nl/nisa functions instead.")
     return error_text
@@ -392,18 +490,22 @@ def first_prompt(level, terse=0):
         f"Reply with ONE python code block containing the imports and the function. No prose.")
 
 
-def repair_prompt(level, source, feedback):
-    """One named change, and the previous code. No rules list, no reference re-sent.
+def repair_prompt(level, source, feedback, ledger=""):
+    """One named change, the previous code, and a short list of already-failed ideas.
 
     The lesson this whole repo keeps re-learning: feeding a verifier's report back verbatim
     reproduces the same mistake, because a report says what is wrong and never what to do.
+    The ledger is fingerprints only -- full traces squeeze the answer out of the context.
     """
-    return (
+    body = (
         f"This NKI kernel for {nkibench.LEVELS[level]['op']} is not right yet.\n\n"
-        f"```python\n{source}\n```\n\n"
+        f"```python\n{clip_source(source)}\n```\n\n"
         f"A checker reports:\n{feedback}\n\n"
         f"Change exactly what the checker names and keep everything else identical. Reply with "
         f"ONE python code block.")
+    if ledger:
+        body += f"\n\nAlready failed (do not repeat):\n{ledger}"
+    return body
 
 
 CODE_BLOCK = re.compile(r"```(?:python)?\s*(.*?)```", re.S)
@@ -505,7 +607,7 @@ def solve(a, level, log):
             graded.append((reward, src, feedback, parts))
             log.write(json.dumps(dict(level=level, round=rnd, reward=reward, parts=parts,
                                       prompt_chars=len(prompt), reply_chars=len(reply),
-                                      code=src, feedback=feedback)) + "\n")
+                                      prompt=prompt, code=src, feedback=feedback)) + "\n")
         log.flush()
         graded.sort(key=lambda g: g[0], reverse=True)
         top = graded[0]
@@ -543,18 +645,7 @@ def solve(a, level, log):
                 print(f"    {n}x  {f[:110]}")
             return best[0], rnd + 1
         tried.append(top[2])
-        repeats = streak
-        if repeats >= 2 and (best[1] or "").strip():
-            # Sampling on this endpoint is greedy, so an unchanged prompt returns an unchanged
-            # answer. Measured: the same TypeError 19 rounds running. Changing the prompt is the
-            # only thing that can change the answer, so say what has already been tried.
-            ledger = "\n".join(f"- {t[:160]}" for t in dict.fromkeys(tried))
-            prompt = (repair_prompt(level, latest[0], latest[1])
-                      + f"\n\nThese approaches have already failed, so do something different:\n"
-                        f"{ledger}")
-            print(f"  same failure {repeats}x — adding a ledger of {len(set(tried))} failed "
-                  f"attempts to break the repeat")
-            continue
+        ledger = compact_ledger(tried)
         if not (latest[0] or "").strip():
             # Nothing came back to repair. Asking it to "fix" an empty code block produced a
             # 202-character prompt and, under greedy sampling, the identical non-answer six
@@ -562,10 +653,89 @@ def solve(a, level, log):
             terse = min(terse + 1, 2)
             prompt = first_prompt(level, terse)
             print(f"  no code yet, so re-asking with a shorter prompt (terseness {terse})")
-        else:
-            prompt = repair_prompt(level, latest[0], latest[1])
+            continue
+        extra = ""
+        if streak >= 2:
+            extra = (" The last message did not change the kernel -- try a different structure, "
+                     "not a rename of the same call.")
+            print(f"  same failure {streak}x — ledger of {len(set(tried))} failed attempts")
+        prompt = repair_prompt(level, latest[0], latest[1] + extra, ledger=ledger)
     print(f"  not solved in {a.rounds} rounds; best reward {best[0]:.2f}")
     return best[0], a.rounds
+
+
+def selftest():
+    """No model, no device. Checks that a verdict is turned into a named change."""
+    cases = [
+        ("raised AttributeError: module 'nki.language' has no attribute 'dot'",
+         "nisa.nc_matmul"),
+        ("raised AttributeError: module 'nki.language' has no attribute 'value'",
+         "nl.ndarray"),
+        ("raised AttributeError: 'NkiTensor' object has no attribute 'mean'",
+         "nl.sum"),
+        ("raised TypeError: 'MemoryRegion' object is not callable",
+         "buffer=nl.sbuf"),
+        ("raised ValueError: SBUF and PSUM tensors must have at least 2 dimensions",
+         "(1, N)"),
+        ("raised ValueError: cannot reshape array of size 32768 into shape (1,64)",
+         "Do not reshape"),
+        ("raised ValueError: dma_copy dst partition dimension 256 exceeds maximum 128",
+         "chunks of at most 128"),
+    ]
+    failed = 0
+    for text, need in cases:
+        got = enrich(text)
+        ok = need in got and got != text
+        print(f"  {'ok' if ok else 'FAIL'}  {need!r} in enrich({text[:48]!r}...)")
+        failed += not ok
+    mm = instruct_on_mismatch(4, "NUMERICAL MISMATCH: worst error 0.4")
+    ok = "larger than one tile" in mm
+    print(f"  {'ok' if ok else 'FAIL'}  level-4 mismatch names tiling")
+    failed += not ok
+    rules = instruct_on_rules(1, "line 4: partition dimension 256 exceeds the maximum of 128. Tile it.")
+    ok = "chunks of at most" in rules
+    print(f"  {'ok' if ok else 'FAIL'}  static tile-size rule names the loop")
+    failed += not ok
+    led = compact_ledger(["wrong A " * 20, "wrong B"])
+    ok = led.count("\n") == 1 and len(led.splitlines()[0]) <= 120
+    print(f"  {'ok' if ok else 'FAIL'}  ledger is short fingerprints")
+    failed += not ok
+    if failed:
+        print(f"SELFTEST FAILED ({failed})")
+        return 1
+    print("SELFTEST PASSED")
+    return 0
+
+
+def dump_log(path, max_prompt=4000, max_code=2500):
+    """Print input → checker → next-round prompt from attempts.jsonl."""
+    rows = []
+    with open(path) as f:
+        for line in f:
+            if line.strip():
+                rows.append(json.loads(line))
+    if not rows:
+        print(f"{path} is empty")
+        return 1
+    print(f"{len(rows)} attempts in {path}\n")
+    for i, r in enumerate(rows):
+        print("=" * 72)
+        print(f"attempt {i}  level {r.get('level')}  round {r.get('round')}  "
+              f"reward {r.get('reward')}")
+        print(f"parts {r.get('parts')}")
+        prompt = r.get("prompt") or ""
+        if not prompt:
+            print("INPUT: (not stored — this line was logged before prompt was saved)")
+        else:
+            print(f"INPUT to the model ({len(prompt)} chars):")
+            print(prompt if len(prompt) <= max_prompt else prompt[:max_prompt] + "\n... [truncated]")
+        code = r.get("code") or ""
+        print(f"\nMODEL CODE ({len(code)} chars):")
+        print(code if len(code) <= max_code else code[:max_code] + "\n... [truncated]")
+        print(f"\nCHECKER said (this is what pass {int(r.get('round', 0)) + 1} will see):")
+        print(r.get("feedback") or "")
+        print()
+    return 0
 
 
 def main():
@@ -591,12 +761,22 @@ def main():
                     help="starting prompt length. Measured on gpt-oss-20b: 0 produced 13,245 "
                          "chars of hidden reasoning and no answer, while 1 answered with code. "
                          "Qwen3-8B is fine at 0.")
-    ap.add_argument("--context", type=int, default=4096,
-                    help="the server's max-model-len; prompt + answer must fit inside it")
+    ap.add_argument("--context", type=int, default=8192,
+                    help="the server's max-model-len; prompt + answer must fit inside it. "
+                         "Seat pods start at 8192; 4096 squeezes the repair prompt.")
     ap.add_argument("--think", action="store_true",
                     help="let the model reason first; costs budget, and it ran out")
     ap.add_argument("--offline", action="store_true")
+    ap.add_argument("--selftest", action="store_true",
+                    help="prove the new feedback helpers without calling a model")
+    ap.add_argument("--dump", nargs="?", const="attempts.jsonl", default=None,
+                    help="print input / code / checker from a JSONL log (default attempts.jsonl)")
     a = ap.parse_args()
+
+    if a.selftest:
+        sys.exit(selftest())
+    if a.dump:
+        sys.exit(dump_log(a.dump))
 
     if not a.offline:
         # Validate before the first request. An empty or scheme-less value produces a hostname
