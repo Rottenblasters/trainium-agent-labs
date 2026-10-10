@@ -340,13 +340,35 @@ def diagnose_mismatch(got, want, tol, source=None):
     worst = tuple(int(i) for i in np.unravel_index(int(np.argmax(err)), got.shape))
     evidence = [f"worst error at {worst}", f"{float(bad.mean()):.1%} of values exceed tolerance"]
     if got.ndim >= 2:
-        r, c = worst[0], worst[-1]
-        partial_row = got.shape[0] % TILE_ROWS != 0 and r >= (got.shape[0] // TILE_ROWS) * TILE_ROWS
-        partial_col = got.shape[-1] % TILE_COLS != 0 and c >= (got.shape[-1] // TILE_COLS) * TILE_COLS
+        # A worst element in a small dimension is not enough to blame that dimension's edge: for
+        # n=129, d=33 every column lies in a partial 512-wide tile. Attribute an edge only when
+        # most bad values are actually concentrated there.
+        bad_count = int(bad.sum())
+        row_start = (got.shape[0] // TILE_ROWS) * TILE_ROWS
+        col_start = (got.shape[-1] // TILE_COLS) * TILE_COLS
+        row_share = float(bad[row_start:, :].sum()) / bad_count if got.shape[0] % TILE_ROWS else 0.0
+        col_share = float(bad[:, col_start:].sum()) / bad_count if got.shape[-1] % TILE_COLS else 0.0
+        # If an entire axis is smaller than one tile, every value is technically in a partial tile,
+        # which provides no directional evidence. Diagnose only a tail after at least one full tile.
+        partial_row = got.shape[0] > TILE_ROWS and got.shape[0] % TILE_ROWS != 0 and row_share >= 0.8
+        partial_col = got.shape[-1] > TILE_COLS and got.shape[-1] % TILE_COLS != 0 and col_share >= 0.8
         if partial_row or partial_col:
             edge = " and ".join(part for part, present in (("final partial row tile", partial_row), ("final partial column tile", partial_col)) if present)
-            return dict(kind="partial_tile_boundary", confidence="high", evidence=evidence + [f"failure is in {edge}"],
-                        instruction="Derive each final tile end with min(tile_start + tile_size, dimension), and use that actual slice shape for both reading and writing.")
+            shares = []
+            if partial_row:
+                shares.append(f"{row_share:.0%} of bad values are in rows {row_start}:{got.shape[0]}")
+            if partial_col:
+                shares.append(f"{col_share:.0%} of bad values are in columns {col_start}:{got.shape[-1]}")
+            instruction = ("Fix the final row tile only: include rows from its tile start through the actual row count, "
+                           "and clamp any row-dependent window bounds to the input length."
+                           if partial_row and not partial_col else
+                           "Fix the final column tile only: derive its end from the actual column count and use that "
+                           "same bound for reading and writing."
+                           if partial_col and not partial_row else
+                           "Derive each final tile end with min(tile_start + tile_size, dimension), and use that actual "
+                           "slice shape for both reading and writing.")
+            return dict(kind="partial_tile_boundary", confidence="high", evidence=evidence + shares + [f"failure is concentrated in {edge}"],
+                        instruction=instruction)
     return dict(kind="numerical_mismatch", confidence="low", evidence=evidence,
                 instruction="Compare the failing tile's intermediate values with the reference and correct the arithmetic without changing unrelated working tiles.")
 
@@ -519,6 +541,15 @@ def selftest():
     d = diagnose_mismatch(want.T, want, 1e-4)
     ok = d and d["kind"] == "transposed_output"
     print(f"  transposed output                -> {'caught' if ok else 'UNDETECTED'}")
+    rc |= 0 if ok else 1
+
+    want = np.ones((129, 33), np.float32)
+    got = want.copy()
+    got[128, :] = 2.0
+    d = diagnose_mismatch(got, want, 1e-4)
+    ok = d and d["kind"] == "partial_tile_boundary" and "final partial row tile" in d["evidence"][-1] \
+        and "column" not in d["evidence"][-1]
+    print(f"  final-row-only anomaly            -> {'caught' if ok else 'UNDETECTED'}")
     rc |= 0 if ok else 1
     return rc
 

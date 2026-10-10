@@ -126,6 +126,16 @@ def repair_prompt(source, feedback, instruction):
     )
 
 
+def repeated_repair_prompt(source, instruction):
+    """Break a deterministic fixed point without re-sending a long failure report."""
+    return (
+        "The previous repair returned code with the SAME failure. Do not repeat the existing code.\n\n"
+        f"```python\n{source}\n```\n\n"
+        f"Make this specific change: {instruction}\n"
+        "Return one complete Python code block only."
+    )
+
+
 def ask(args, prompt):
     budget = min(args.max_tokens, max(256, args.context - len(prompt) // 4 - 64))
     body = {
@@ -190,19 +200,29 @@ def solve(args, level, log):
         log.flush()
         top = max(graded, key=lambda item: item[0])
         best = max(best, (top[0], top[1]), key=lambda item: item[0])
-        print(f"round {round_number}: reward {top[0]:.2f}, best {best[0]:.2f} ({time.perf_counter() - started:.2f}s)")
+        print(f"round {round_number}: reward {top[0]:.2f}, best {best[0]:.2f}, "
+              f"prompt ~{len(prompt) // 4} tokens ({time.perf_counter() - started:.2f}s)")
         print(textwrap.indent(top[2][:700], "  "))
         if top[0] >= sum(WEIGHTS.values()) - 1e-9:
             return top[0], round_number + 1
+        repeated = bool(failures and top[2] == failures[-1])
         failures.append(top[2])
-        if failures.count(top[2]) >= args.give_up_after:
+        consecutive = 1
+        for prior in reversed(failures[:-1]):
+            if prior != top[2]:
+                break
+            consecutive += 1
+        if consecutive >= args.give_up_after:
             print("  stopping: the same checker failure repeated; improve the repair instruction or checker")
             return best[0], round_number + 1
         if not top[1]:
             prompt = first_prompt(level)
+        elif repeated:
+            prompt = repeated_repair_prompt(top[1], top[3])
         else:
-            ledger = "\n".join(f"- {item[:180]}" for item in dict.fromkeys(failures[-3:]))
-            prompt = repair_prompt(top[1], top[2], top[3]) + f"\n\nAlready failed:\n{ledger}"
+            # The first repair receives the full diagnosis once. Duplicating it in a ledger wasted
+            # context and made deterministic models return the same candidate indefinitely.
+            prompt = repair_prompt(top[1], top[2], top[3])
     return best[0], args.rounds
 
 
