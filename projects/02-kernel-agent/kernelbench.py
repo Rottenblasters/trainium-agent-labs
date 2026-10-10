@@ -18,6 +18,7 @@ Only numpy is required.
 
 import argparse
 import ast
+import re
 import sys
 import textwrap
 import traceback
@@ -239,56 +240,151 @@ def check_rules(src, n):
 
 # ---------------------------------------------------------------- verification
 
-def describe_mismatch(got, want, tol):
-    """The message your agent has to learn from. Vague here means slow there."""
+def _source_evidence(source, values):
+    """Return concrete source clues without claiming they prove the defect."""
+    if not source:
+        return []
+    clues = []
+    for value in values:
+        if re.search(rf"(?<!\d){value}(?!\d)", source):
+            clues.append(f"source contains hard-coded {value}")
+    return clues
+
+
+def _ranges(mask):
+    """Turn a 1-D boolean mask into inclusive-start/exclusive-end ranges."""
+    out, start = [], None
+    for i, present in enumerate(mask):
+        if present and start is None:
+            start = i
+        elif not present and start is not None:
+            out.append((start, i))
+            start = None
+    if start is not None:
+        out.append((start, len(mask)))
+    return out
+
+
+def diagnose_mismatch(got, want, tol, source=None):
+    """Classify common kernel failures from output and source evidence.
+
+    This is deliberately a diagnosis, not a proof of the bug. A high-confidence result needs a
+    distinctive output pattern; source clues increase confidence but never replace numerical tests.
+    """
     got = np.asarray(got, dtype=np.float64)
     want = np.asarray(want, dtype=np.float64)
     if got.shape != want.shape:
-        return (f"WRONG SHAPE: returned {got.shape}, reference is {want.shape}. "
-                f"Check the output-size formula, not the arithmetic.")
+        if got.ndim == want.ndim == 2 and got.shape == want.T.shape and np.allclose(got, want.T, rtol=tol, atol=tol):
+            return dict(kind="transposed_output", confidence="high", evidence=["output equals reference transpose"],
+                        instruction="Swap the output row and column indices; the kernel returns the transpose of the required layout.")
+        return dict(kind="wrong_shape", confidence="high", evidence=[f"returned {got.shape}, reference is {want.shape}"],
+                    instruction="Fix only output allocation and slice bounds so the returned array has the reference shape.")
     if not np.all(np.isfinite(got)):
-        n_nan = int(np.isnan(got).sum())
-        n_inf = int(np.isinf(got).sum())
-        where = np.argwhere(~np.isfinite(got))[0]
-        return (f"NON-FINITE OUTPUT: {n_nan} NaN and {n_inf} Inf values, first at index "
-                f"{tuple(int(i) for i in where)}. Overflow in exp, or a division by a zero "
-                f"denominator. Subtract the max before exponentiating.")
-    denom = np.maximum(np.abs(want), 1e-30)
-    rel = np.abs(got - want) / denom
-    i = int(np.argmax(rel))
-    idx = np.unravel_index(i, got.shape)
-    worst = float(rel.flat[i])
-    if worst <= tol:
+        n_nan, n_inf = int(np.isnan(got).sum()), int(np.isinf(got).sum())
+        where = tuple(int(i) for i in np.argwhere(~np.isfinite(got))[0])
+        return dict(kind="non_finite", confidence="high", evidence=[f"{n_nan} NaN, {n_inf} Inf; first at {where}"],
+                    instruction="Make the reduction numerically stable and initialize every accumulator. For softmax, subtract the row maximum before exp and ensure the denominator is positive.")
+
+    scale = float(np.sqrt((want ** 2).mean())) or 1.0
+    err = np.abs(got - want)
+    bad = err / scale > tol
+    if not bad.any():
         return None
-    frac = float((rel > tol).mean())
-    msg = [f"NUMERICAL MISMATCH: worst relative error {worst:.3g} at index "
-           f"{tuple(int(x) for x in idx)} (tolerance {tol:g}).",
-           f"  expected {want.flat[i]:+.6g}, got {got.flat[i]:+.6g}",
-           f"  {frac:.1%} of elements are outside tolerance"]
-    # Localise it, because "somewhere" is useless feedback.
+
+    # A contiguous zero region against nonzero expected values is normally an unwritten output
+    # slice, not bad arithmetic. Detect it before general mismatch diagnostics.
+    zero = np.abs(got) < 1e-12
+    expected_nonzero = np.abs(want) > max(scale * tol, 1e-12)
+    if got.ndim == 2:
+        # ReLU legitimately produces zeros. Measure zeroing only among elements that the reference
+        # says should be nonzero, otherwise a half-negative column looks like an unwritten tile.
+        nonzero_by_col = expected_nonzero.sum(axis=0)
+        nonzero_by_row = expected_nonzero.sum(axis=1)
+        zero_cols = np.divide((zero & expected_nonzero).sum(axis=0), nonzero_by_col,
+                              out=np.zeros_like(nonzero_by_col, dtype=np.float64), where=nonzero_by_col > 0) >= 0.9
+        zero_rows = np.divide((zero & expected_nonzero).sum(axis=1), nonzero_by_row,
+                              out=np.zeros_like(nonzero_by_row, dtype=np.float64), where=nonzero_by_row > 0) >= 0.9
+        col_ranges, row_ranges = _ranges(zero_cols), _ranges(zero_rows)
+        if col_ranges or row_ranges:
+            regions = []
+            if row_ranges:
+                regions.append("rows " + ", ".join(f"{a}:{b}" for a, b in row_ranges))
+            if col_ranges:
+                regions.append("columns " + ", ".join(f"{a}:{b}" for a, b in col_ranges))
+            values = [TILE_ROWS, TILE_COLS]
+            evidence = ["output is zero where the reference is nonzero: " + "; ".join(regions)]
+            evidence.extend(_source_evidence(source, values))
+            return dict(kind="unwritten_output_region", confidence="high", evidence=evidence,
+                        instruction="Keep the arithmetic, but fix loop coverage and destination slices so every row and column of the current tile is written. Use the tile's actual slice shape, not a fixed 128 or 512 output width.")
+
+    # A max reduction initialized at zero is a distinctive and frequent error for all-negative rows.
+    if got.ndim == want.ndim == 1 and np.all(want < 0) and np.allclose(got, 0, atol=tol):
+        return dict(kind="wrong_max_identity", confidence="high", evidence=["all expected maxima are negative but output is zero"],
+                    instruction="Initialize each row maximum to negative infinity, not zero, so all-negative rows remain negative.")
+
+    good = ~bad
+    if good.any() and bad.any():
+        # Constant additive error is common in normalization/bias code.
+        delta = got - want
+        median_delta = float(np.median(delta))
+        if np.std(delta) <= max(abs(median_delta) * 0.02, scale * tol * 2) and abs(median_delta) > scale * tol:
+            return dict(kind="constant_offset", confidence="medium", evidence=[f"output-reference is consistently {median_delta:+.4g}"],
+                        instruction="Check the missing or duplicated additive term: bias, mean subtraction, or log-normalizer. The error is a near-constant offset.")
+        denom = float(np.dot(want.ravel(), want.ravel()))
+        factor = float(np.dot(got.ravel(), want.ravel()) / denom) if denom else 1.0
+        residual = np.sqrt(np.mean((got - factor * want) ** 2))
+        if abs(factor - 1.0) > 0.02 and residual <= scale * tol * 5:
+            return dict(kind="constant_scale", confidence="medium", evidence=[f"output is approximately {factor:.4g}x the reference"],
+                        instruction="Check the normalization divisor, averaging count, or scaling coefficient. The output has a near-constant multiplicative error.")
+
+    worst = tuple(int(i) for i in np.unravel_index(int(np.argmax(err)), got.shape))
+    evidence = [f"worst error at {worst}", f"{float(bad.mean()):.1%} of values exceed tolerance"]
     if got.ndim >= 2:
-        r, c = int(idx[0]), int(idx[-1])
-        in_partial_row = r >= (got.shape[0] // TILE_ROWS) * TILE_ROWS
-        in_partial_col = c >= (got.shape[-1] // TILE_COLS) * TILE_COLS
-        if in_partial_row or in_partial_col:
-            which = " and ".join(x for x in
-                                 ["the final PARTIAL ROW tile" if in_partial_row else "",
-                                  "the final PARTIAL COLUMN tile" if in_partial_col else ""] if x)
-            msg.append(f"  this is in {which} (shape {got.shape}, tile "
-                       f"{TILE_ROWS}x{TILE_COLS}) — the ragged edge is the likely cause")
-        elif frac > 0.5:
-            msg.append("  most elements are wrong, so this is the core arithmetic, "
-                       "not an edge case")
-        else:
-            msg.append(f"  row {r} of {got.shape[0]}, column {c} of {got.shape[-1]}, "
-                       "inside a full tile")
-    return "\n".join(msg)
+        r, c = worst[0], worst[-1]
+        partial_row = got.shape[0] % TILE_ROWS != 0 and r >= (got.shape[0] // TILE_ROWS) * TILE_ROWS
+        partial_col = got.shape[-1] % TILE_COLS != 0 and c >= (got.shape[-1] // TILE_COLS) * TILE_COLS
+        if partial_row or partial_col:
+            edge = " and ".join(part for part, present in (("final partial row tile", partial_row), ("final partial column tile", partial_col)) if present)
+            return dict(kind="partial_tile_boundary", confidence="high", evidence=evidence + [f"failure is in {edge}"],
+                        instruction="Derive each final tile end with min(tile_start + tile_size, dimension), and use that actual slice shape for both reading and writing.")
+    return dict(kind="numerical_mismatch", confidence="low", evidence=evidence,
+                instruction="Compare the failing tile's intermediate values with the reference and correct the arithmetic without changing unrelated working tiles.")
 
 
-def verify(kernel_fn, n, tol=1e-4, stop_early=True):
+def format_diagnosis(diagnosis, got, want, tol):
+    """Keep the existing CLI-readable report while exposing a structured result to agents."""
+    if diagnosis["kind"] == "wrong_shape":
+        return "WRONG SHAPE: " + diagnosis["evidence"][0] + ". " + diagnosis["instruction"]
+    if diagnosis["kind"] == "transposed_output":
+        return "TRANSPOSED OUTPUT: " + diagnosis["instruction"]
+    if diagnosis["kind"] == "non_finite":
+        return "NON-FINITE OUTPUT: " + diagnosis["evidence"][0] + ". " + diagnosis["instruction"]
+    if diagnosis["kind"] == "unwritten_output_region":
+        return "UNWRITTEN OUTPUT REGION: " + ". ".join(diagnosis["evidence"]) + ". " + diagnosis["instruction"]
+    if diagnosis["kind"] == "wrong_max_identity":
+        return "WRONG REDUCTION IDENTITY: " + diagnosis["evidence"][0] + ". " + diagnosis["instruction"]
+    if diagnosis["kind"] in ("constant_offset", "constant_scale"):
+        return f"{diagnosis['kind'].replace('_', ' ').upper()}: " + ". ".join(diagnosis["evidence"]) + ". " + diagnosis["instruction"]
+    got, want = np.asarray(got, np.float64), np.asarray(want, np.float64)
+    err = np.abs(got - want)
+    scale = float(np.sqrt((want ** 2).mean())) or 1.0
+    i = int(np.argmax(err))
+    idx = tuple(int(x) for x in np.unravel_index(i, got.shape))
+    return (f"NUMERICAL MISMATCH: worst relative error {float(err.max()) / scale:.3g} at index {idx} "
+            f"(tolerance {tol:g}).\n  expected {want.flat[i]:+.6g}, got {got.flat[i]:+.6g}\n  "
+            + ". ".join(diagnosis["evidence"]) + ". " + diagnosis["instruction"])
+
+
+def describe_mismatch(got, want, tol, source=None):
+    """The message your agent learns from, backed by a structured anomaly diagnosis."""
+    diagnosis = diagnose_mismatch(got, want, tol, source)
+    return None if diagnosis is None else format_diagnosis(diagnosis, got, want, tol)
+
+
+def verify(kernel_fn, n, tol=1e-4, stop_early=True, source=None):
     spec = LEVELS[n]
     cases = spec["build"]()
-    failures, passed = [], 0
+    failures, diagnoses, passed = [], [], 0
     for label, args in cases:
         try:
             want = spec["ref"](*args)
@@ -303,15 +399,17 @@ def verify(kernel_fn, n, tol=1e-4, stop_early=True):
             if stop_early:
                 break
             continue
-        m = describe_mismatch(got, want, tol)
+        diagnosis = diagnose_mismatch(got, want, tol, source)
+        m = None if diagnosis is None else format_diagnosis(diagnosis, got, want, tol)
         if m:
             shp = tuple(np.shape(args[0]))
             failures.append((f"{label} input{shp}", m))
+            diagnoses.append(diagnosis)
             if stop_early:
                 break
         else:
             passed += 1
-    return dict(level=n, total=len(cases), passed=passed, failures=failures,
+    return dict(level=n, total=len(cases), passed=passed, failures=failures, diagnoses=diagnoses,
                 ok=(passed == len(cases)))
 
 
@@ -358,6 +456,19 @@ def kernel(x, a, b):
     return np.einsum('ij,->ij', a * x + b, 1.0).clip(0)
 """
 
+_BAD_1_COVERAGE = """
+import numpy as np
+def kernel(x, a, b):
+    out = np.zeros_like(x)
+    rows, cols = x.shape
+    for r0 in range(0, rows, 128):
+        for c0 in range(0, cols, 512):
+            tile = x[r0:r0+128, c0:c0+512]
+            value = a * tile + b
+            out[r0:r0+tile.shape[0], c0:c0+128] = np.where(value[:, :128] > 0, value[:, :128], 0.0)
+    return out
+"""
+
 
 def selftest():
     print("Proving the harness catches planted bugs. If any line says UNDETECTED, the")
@@ -384,6 +495,31 @@ def selftest():
     v = check_rules("import numpy as np\ndef kernel(x):\n    return x.sum(axis=1)\n", 2)
     print(f"  level-2 .sum() cheat            -> {'caught: ' + v[0] if v else 'UNDETECTED'}")
     rc |= 0 if v else 1
+
+    print()
+    ns = {}
+    exec(compile(_BAD_1_COVERAGE, "coverage", "exec"), ns)
+    r = verify(ns["kernel"], 1, source=_BAD_1_COVERAGE)
+    d = r["diagnoses"][0] if r["diagnoses"] else None
+    ok = d and d["kind"] == "unwritten_output_region" and "columns 128:512" in d["evidence"][0]
+    print(f"  unwritten full-tile columns      -> {'caught with coverage diagnosis' if ok else 'UNDETECTED'}")
+    rc |= 0 if ok else 1
+
+    d = diagnose_mismatch(np.array([[np.nan]], np.float32), np.array([[1.0]], np.float32), 1e-4)
+    ok = d and d["kind"] == "non_finite"
+    print(f"  NaN/Inf anomaly                  -> {'caught' if ok else 'UNDETECTED'}")
+    rc |= 0 if ok else 1
+
+    d = diagnose_mismatch(np.zeros(3, np.float32), -np.ones(3, np.float32), 1e-4)
+    ok = d and d["kind"] == "wrong_max_identity"
+    print(f"  max initialized to zero          -> {'caught' if ok else 'UNDETECTED'}")
+    rc |= 0 if ok else 1
+
+    want = np.arange(6, dtype=np.float32).reshape(2, 3)
+    d = diagnose_mismatch(want.T, want, 1e-4)
+    ok = d and d["kind"] == "transposed_output"
+    print(f"  transposed output                -> {'caught' if ok else 'UNDETECTED'}")
+    rc |= 0 if ok else 1
     return rc
 
 

@@ -67,17 +67,17 @@ def grade(source, level, tol):
     """Grade one candidate without subprocesses or lossy CLI-output parsing."""
     parts = {name: False for name in WEIGHTS}
     if not source.strip():
-        return 0.0, parts, "No code came back. Reply with one complete Python code block defining `kernel`.", ""
+        return 0.0, parts, "No code came back. Reply with one complete Python code block defining `kernel`.", "", None
     try:
         compiled = compile(source, "<candidate>", "exec")
         parts["parses"] = True
     except SyntaxError as exc:
-        return 0.0, parts, f"The code does not parse: {exc.msg} on line {exc.lineno}.", ""
+        return 0.0, parts, f"The code does not parse: {exc.msg} on line {exc.lineno}.", "", None
 
     violations = kb.check_rules(source, level)
     if violations:
         feedback = " ".join(violations)
-        return WEIGHTS["parses"], parts, feedback, repair_instruction(feedback)
+        return WEIGHTS["parses"], parts, feedback, repair_instruction(feedback), None
     parts["rules"] = True
 
     namespace = {"__name__": "candidate"}
@@ -85,23 +85,24 @@ def grade(source, level, tol):
         exec(compiled, namespace)
     except Exception as exc:
         feedback = f"The file fails while importing: {type(exc).__name__}: {exc}"
-        return sum(WEIGHTS[k] for k, ok in parts.items() if ok), parts, feedback, repair_instruction(feedback)
+        return sum(WEIGHTS[k] for k, ok in parts.items() if ok), parts, feedback, repair_instruction(feedback), None
     kernel = namespace.get("kernel")
     if not callable(kernel):
         feedback = "The file defines no callable function named `kernel`."
-        return sum(WEIGHTS[k] for k, ok in parts.items() if ok), parts, feedback, repair_instruction(feedback)
+        return sum(WEIGHTS[k] for k, ok in parts.items() if ok), parts, feedback, repair_instruction(feedback), None
     parts["loads"] = True
 
-    result = kb.verify(kernel, level, tol=tol, stop_early=False)
+    result = kb.verify(kernel, level, tol=tol, stop_early=False, source=source)
     passed, total = result["passed"], result["total"]
     if result["ok"]:
         parts["correct"] = True
-        return sum(WEIGHTS.values()), parts, "Correct on every hostile test case.", ""
+        return sum(WEIGHTS.values()), parts, "Correct on every hostile test case.", "", None
     label, feedback = result["failures"][0]
     feedback = f"{passed} of {total} cases passed. First failure ({label}): {feedback}"
+    diagnosis = result["diagnoses"][0]
     reward = sum(WEIGHTS[k] for k, ok in parts.items() if ok)
     reward += WEIGHTS["correct"] * passed / total
-    return reward, parts, feedback, repair_instruction(feedback)
+    return reward, parts, feedback, diagnosis["instruction"], diagnosis
 
 
 def first_prompt(level):
@@ -180,11 +181,12 @@ def solve(args, level, log):
         graded = []
         for reply in replies:
             source = extract_code(reply)
-            reward, parts, feedback, instruction = grade(source, level, args.tol)
-            graded.append((reward, source, feedback, instruction, parts))
+            reward, parts, feedback, instruction, diagnosis = grade(source, level, args.tol)
+            graded.append((reward, source, feedback, instruction, parts, diagnosis))
             log.write(json.dumps({"level": level, "round": round_number, "reward": reward,
                                   "parts": parts, "prompt_chars": len(prompt), "reply_chars": len(reply),
-                                  "code": source, "feedback": feedback, "instruction": instruction}) + "\n")
+                                  "code": source, "feedback": feedback, "instruction": instruction,
+                                  "diagnosis": diagnosis}) + "\n")
         log.flush()
         top = max(graded, key=lambda item: item[0])
         best = max(best, (top[0], top[1]), key=lambda item: item[0])
