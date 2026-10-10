@@ -42,3 +42,5 @@ projects/*/attempts.jsonl
 
 # agent runs started with nohup ... > run.log (README pattern for surviving a dropped kubectl exec)
 run*.log
+
+set_aws_credentials.ps1
