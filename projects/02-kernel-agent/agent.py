@@ -52,6 +52,57 @@ REASONING_KEYS = ("reasoning", "reasoning_content")
 WEIGHTS = dict(parses=0.1, rules=0.2, runs=0.2, correct=0.5)
 
 
+def failure_class(feedback, parts):
+    """A small, stable taxonomy for logs and prompt routing.
+
+    Keep this deliberately based on the checker output rather than on model prose.  It makes the
+    eventual failure report count real, independently verified events.
+    """
+    text = feedback.lower()
+    # repair_prompt only has text, while logging also has checker parts.  An empty mapping is
+    # therefore "unknown parts", not evidence that the candidate failed to parse.
+    if (parts and not parts.get("parses")) or "does not parse" in text:
+        return "parse"
+    if (parts and not parts.get("rules")) or "rule violation" in text:
+        return "rule_violation"
+    if "no module named" in text or "could not be loaded" in text or "no attribute" in text:
+        return "api_or_import"
+    if "cannot simulate" in text:
+        return "environment"
+    if "raised " in text:
+        return "runtime"
+    if "wrong shape" in text:
+        return "shape_or_ragged_tile"
+    if "zeros while" in text or "of the output is zero" in text:
+        return "output_writeback"
+    if "non-finite" in text:
+        return "numerical_stability"
+    if "hbm traffic" in text or "memory bound" in text:
+        return "traffic_optimization"
+    if "shapes passed" in text:
+        return "numerical_mismatch"
+    if "correct on every shape" in text:
+        return "verified"
+    return "unknown"
+
+
+def passed_shapes(feedback):
+    """Extract the useful fine-grained progress hidden by the coarse reward."""
+    match = re.search(r"(\d+) of (\d+) shapes passed", feedback)
+    return int(match.group(1)) if match else 0
+
+
+def candidate_key(candidate):
+    """Prefer a clean, more-correct candidate before a coarse reward tie-break.
+
+    A candidate that happened to parse but failed static rules can share a reward with a candidate
+    that ran cleanly.  The latter is always the better repair substrate.
+    """
+    reward, source, feedback, parts = candidate
+    return (int(parts.get("rules", False)), int(parts.get("runs", False)),
+            passed_shapes(feedback), reward, len(source))
+
+
 def grade(source, level):
     """Returns (reward, parts, feedback). Feedback is an INSTRUCTION, never just a verdict."""
     parts = dict(parses=False, rules=False, runs=False, correct=False)
@@ -398,10 +449,23 @@ def repair_prompt(level, source, feedback):
     The lesson this whole repo keeps re-learning: feeding a verifier's report back verbatim
     reproduces the same mistake, because a report says what is wrong and never what to do.
     """
+    category = failure_class(feedback, {})
+    next_step = {
+        "parse": "Return a complete, syntactically valid replacement kernel.",
+        "rule_violation": "Make only the named static-rule repair; do not redesign the kernel.",
+        "api_or_import": "Use only the concrete NKI API names named by the checker.",
+        "shape_or_ragged_tile": "Correct the output/tile bounds; preserve the working interior computation.",
+        "output_writeback": "Trace the computed tile through PSUM, SBUF, and the correct output slice.",
+        "numerical_stability": "Initialize or normalize the affected tile before it is read.",
+        "traffic_optimization": "Keep numerics unchanged and reduce only the redundant data movement.",
+        "runtime": "Fix the reported runtime error without changing unrelated algorithmic choices.",
+        "numerical_mismatch": "Use the failing shape and location to change only the incorrect index, bound, or arithmetic step.",
+    }.get(category, "Make the smallest change that resolves the checker report.")
     return (
         f"This NKI kernel for {nkibench.LEVELS[level]['op']} is not right yet.\n\n"
         f"```python\n{source}\n```\n\n"
-        f"A checker reports:\n{feedback}\n\n"
+        f"A checker reports [{category}]:\n{feedback}\n\n"
+        f"Next action: {next_step}\n"
         f"Change exactly what the checker names and keep everything else identical. Reply with "
         f"ONE python code block.")
 
@@ -487,7 +551,7 @@ def offline_answers(level, n, rnd):
 
 # ---------------------------------------------------------------- the loop
 
-def solve(a, level, log):
+def solve(a, level, log, taxonomy):
     print(f"\n=========== level {level}: {nkibench.LEVELS[level]['op']} ===========")
     terse = a.terse
     prompt = first_prompt(level, terse)
@@ -503,11 +567,19 @@ def solve(a, level, log):
             src = extract_code(reply)
             reward, parts, feedback = grade(src, level)
             graded.append((reward, src, feedback, parts))
-            log.write(json.dumps(dict(level=level, round=rnd, reward=reward, parts=parts,
-                                      prompt_chars=len(prompt), reply_chars=len(reply),
-                                      code=src, feedback=feedback)) + "\n")
+            category = failure_class(feedback, parts)
+            taxonomy[category] = taxonomy.get(category, 0) + 1
+            log.write(json.dumps(dict(
+                level=level, round=rnd, reward=reward, parts=parts,
+                failure_class=category, passed_shapes=passed_shapes(feedback),
+                verified=(category == "verified"),
+                # Estimates are sufficient for allocating the context window consistently;
+                # API responses do not expose prompt-token usage on every endpoint.
+                prompt_tokens_est=(len(prompt) + 3) // 4,
+                reply_tokens_est=(len(reply) + 3) // 4,
+                prompt_chars=len(prompt), reply_chars=len(reply), code=src, feedback=feedback)) + "\n")
         log.flush()
-        graded.sort(key=lambda g: g[0], reverse=True)
+        graded.sort(key=candidate_key, reverse=True)
         top = graded[0]
         if top[0] > best[0]:
             best = (top[0], top[1], top[2])
@@ -571,7 +643,7 @@ def solve(a, level, log):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--level", type=int, choices=sorted(nkibench.LEVELS))
-    ap.add_argument("--all", action="store_true", help="levels 1 to 4")
+    ap.add_argument("--all", action="store_true", help="levels 1 to 7 (including traffic-gated optimization levels)")
     ap.add_argument("--rounds", type=int, default=4)
     ap.add_argument("--samples", type=int, default=2)
     ap.add_argument("--max-tokens", type=int, default=MIN_ANSWER_TOKENS)
@@ -620,9 +692,12 @@ def main():
     else:
         print("*** OFFLINE: replaying the reference kernel. Numbers are meaningless. ***")
 
-    levels = sorted(nkibench.LEVELS)[:4] if a.all else [a.level or 1]
+    # Levels 5--7 already have references and traffic gates in nkibench.  Leaving them out of
+    # the normal evaluation path made the delivery score invisible even when a kernel was ready.
+    levels = [lv for lv in sorted(nkibench.LEVELS) if lv <= 7] if a.all else [a.level or 1]
     full = sum(WEIGHTS.values())
     history = {lv: [] for lv in levels}
+    taxonomy = {}
 
     with open(a.log, "a") as log:
         for rep in range(a.repeat):
@@ -630,7 +705,7 @@ def main():
                 print(f"\n################ run {rep + 1} of {a.repeat} ################")
             results = []
             for level in levels:
-                results.append((level,) + solve(a, level, log))
+                results.append((level,) + solve(a, level, log, taxonomy))
                 history[level].append(results[-1][1])
 
             print("\n=========== summary ===========")
@@ -650,6 +725,9 @@ def main():
                   f"best {max(got):.2f}  worst {min(got):.2f}  "
                   f"mean {sum(got) / len(got):.2f}  all={[round(r, 2) for r in got]}")
         print("\n  Report the rate, not your best run. A level that solves 1 in 3 times is not solved.")
+    print("\n=========== verified failure taxonomy ===========")
+    for category, count in sorted(taxonomy.items(), key=lambda item: (-item[1], item[0])):
+        print(f"  {category:28} {count}")
     print(f"\nattempts logged to {a.log}")
 
 
